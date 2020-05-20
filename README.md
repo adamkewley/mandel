@@ -1,10 +1,10 @@
 # mandel
 
-C++ GUI for vieeing a standard Mandelbrot set.
+C++ GUI for viewing a standard Mandelbrot set.
 
 ![screenshot](mandel-edited.gif)
 
-This is just a personal throwaway project, rather tan something
+This is just a personal throwaway project, rather than something
 serious. I want to explore SDL2, OpenGL, and (maybe) OpenCL with a toy
 problem that is fairly well-defined.
 
