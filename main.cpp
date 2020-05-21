@@ -1,7 +1,10 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
+#include <GL/glew.h>
+#include <GL/glut.h>
 
 #include <iostream>
+#include <fstream>
 #include <cassert>
 #include <algorithm>
 #include <sstream>
@@ -107,28 +110,12 @@ unsigned msb(unsigned i) {
     return ret;
 }
 
-std::vector<Uint32> make_color_lut(const SDL_PixelFormat* fmt, unsigned iters, unsigned shift) {
-    std::vector<Uint32> ret;
-    for (auto i = 0U; i < iters; ++i) {
-        Uint8 brightness = i << shift;
-        ret.push_back(SDL_MapRGB(fmt, brightness, brightness, brightness));
-    }
-    ret.push_back(SDL_MapRGB(fmt, 0x00, 0x00, 0x00));
-    return ret;
-}
-
 struct State {
-    explicit State(SDL_Surface* _surf): surf{_surf} {
-        assert(surf != nullptr);
-        this->color_lut = make_color_lut(surf->format, num_iterations, 4U);
+    explicit State(int _width, int _height) : width{_width}, height{_height}  {
     }
 
     Dimensions<int> display_dimensions() {
-        return {surf->w, surf->h};
-    }
-
-    Uint32 color(unsigned iters) {
-        return color_lut.at(iters);
+        return {width, height};
     }
 
     unsigned iterations() const {
@@ -137,10 +124,6 @@ struct State {
 
     unsigned iterations(unsigned _num_iterations) {
         num_iterations = std::clamp(_num_iterations, 1U, 1024U);
-        unsigned shift = num_iterations <= 256 ?
-                std::min(7U, 9-msb(num_iterations)) :
-                0U;
-        this->color_lut = make_color_lut(surf->format, num_iterations, shift);
         return num_iterations;
     }
 
@@ -150,60 +133,249 @@ struct State {
     };
 
     Rect<Real> rect = initial_rect;
-    SDL_Surface* surf;
 
 private:
     unsigned num_iterations = 16;
-    std::vector<Uint32> color_lut;
+    int width = 0;
+    int height = 0;
 };
 
-unsigned mandel_iterations(Real x0, Real y0, unsigned max_iterations) {
-    Real x = 0;
-    Real y = 0;
-    Real x2 = 0;
-    Real y2 = 0;
-    size_t iter = 0;
+struct ExampleGLProg {
+  GLuint program;
+  GLuint vertex_shader;
+  GLuint frag_shader;
+  GLint attrib_LVertexPos2D;
+  GLuint vao;
+  GLuint vbo;
+  GLuint ibo;
+  GLint uniform_x_rescale;
+  GLint uniform_x_offset;
+  GLint uniform_y_rescale;
+  GLint uniform_y_offset;
+  GLint uniform_num_iterations;
+};
 
-    while (iter < max_iterations and x2+y2 <= 4) {
-        y = 2*x*y + y0;
-        x = x2-y2 + x0;
-        x2 = x*x;
-        y2 = y*y;
-        ++iter;
-    }
+void draw_mandelbrot(State& s, ExampleGLProg& p, SDL_Window* w) {
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glUseProgram(p.program);
 
-    return iter;
+
+
+  glUniform1f(p.uniform_x_rescale, s.rect.dimensions.w/2.0f);
+  glUniform1f(p.uniform_x_offset, s.rect.dimensions.w/2.0f + s.rect.pos.x);
+  glUniform1f(p.uniform_y_rescale, s.rect.dimensions.h/2.0f);
+  glUniform1f(p.uniform_y_offset, -s.rect.dimensions.h/2.0f - s.rect.pos.y);
+  glUniform1i(p.uniform_num_iterations, s.iterations());
+  glBindVertexArray(p.vao);
+  glDrawElements(GL_TRIANGLE_FAN, 4, GL_UNSIGNED_INT, nullptr);
+  glBindVertexArray(static_cast<GLuint>(0));
+  glUseProgram(static_cast<GLuint>(0));
+  glDisableClientState(GL_VERTEX_ARRAY);
+  //  draw_mandelbrot_software(s);
 }
 
-Uint32 mandel_color(State& s, Real x0, Real y0, unsigned num_iterations) {
-    return s.color(mandel_iterations(x0, y0, num_iterations));
+std::string load_into_string(const char* path) {
+  std::ifstream f{path};
+
+  if (not f) {
+    std::stringstream ss;
+    ss << path << ": unable to load file";
+    throw std::runtime_error{ss.str()};
+  }
+
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
 }
 
-void draw_mandelbrot(State& s) {
-    if (SDL_LockSurface(s.surf) != 0) {
-        throw std::runtime_error{"draw_mandelbrot: unable to lock SDL_Surface for software rendering"};
+ExampleGLProg create_prog() {
+    GLuint prog = glCreateProgram();
+    // dtor: glDeleteProgram
+    if (prog == 0) {
+        throw std::runtime_error{"OpenGL: glCreateProgram() failed"};
     }
 
-    const Point<Real> origin = s.rect.pos;
-    const Point<Real> one_unit_abspos =
-            map(PointInRect<int>{.point = {1, 1}, .rect = {.pos = {0,0}, .dimensions = s.display_dimensions()}}, s.rect).point;
-    const Point<Real> one_unit_relpos = one_unit_abspos - origin;
-    const Dimensions<int> d = s.display_dimensions();
+    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+    // dtor: glDeleteShader
+    if (vertex_shader == 0) {
+      // LEAKS: prog
+      throw std::runtime_error{"OpenGL: glCreateShader() failed"};
+    }
 
-    auto pixels = static_cast<Uint32*>(s.surf->pixels);
-    unsigned rowstart = 0;
-    Point<Real> realpos = origin;
+    {
+      std::string src = load_into_string("../shader.vert");
+      const char* s = src.c_str();
+      glShaderSource(vertex_shader, 1, &s, nullptr);
+      glCompileShader(vertex_shader);
+    }
 
-    for (Point<int> p{}; p.y < d.h; ++p.y, rowstart+=d.w) {
-        realpos.x = origin.x;
-        for (p.x = 0; p.x < d.w; ++p.x) {
-            pixels[rowstart + p.x] = mandel_color(s, realpos.x, realpos.y, s.iterations());
-            realpos.x += one_unit_relpos.x;
+    // error check: vertex shader compilation
+    {
+        GLint params;
+        glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &params);
+        if (params == GL_FALSE) {
+            GLint log_len = 0;
+            glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &log_len);
+
+            std::vector<GLchar> errmsg(log_len);
+            glGetShaderInfoLog(vertex_shader, log_len, &log_len, errmsg.data());
+
+            std::stringstream ss;
+            ss << "OpenGL: glCompileShader() failed";
+            ss << errmsg.data();
+            // LEAKS: prog + vertex_shader
+            throw std::runtime_error{ss.str()};
         }
-        realpos.y += one_unit_relpos.y;
     }
 
-    SDL_UnlockSurface(s.surf);
+    glAttachShader(prog, vertex_shader);
+    // glDetachShader
+
+    GLuint frag_shader = glCreateShader(GL_FRAGMENT_SHADER);
+    // glDeleteShader
+    if (frag_shader == 0) {
+      // LEAKS: prog
+      // LEAKS: shader
+      throw std::runtime_error{"OpenGL: glCreateShader() failed"};
+    }
+
+    {
+      std::string src = load_into_string("../shader.frag");
+      const char* s = src.c_str();
+      glShaderSource(frag_shader, 1, &s, nullptr);
+      glCompileShader(frag_shader);
+    }
+
+    // error check: fragment shader compilation
+    {
+      GLint params = GL_FALSE;
+      glGetShaderiv(frag_shader, GL_COMPILE_STATUS, &params);
+      if (params == GL_FALSE) {
+        GLint log_len = 0;
+        glGetShaderiv(frag_shader, GL_INFO_LOG_LENGTH, &log_len);
+
+        std::vector<GLchar> errmsg(log_len);
+        glGetShaderInfoLog(frag_shader, log_len, &log_len, errmsg.data());
+
+        std::stringstream ss;
+        ss << "OpenGL: glCompileShader() failed: ";
+        ss << errmsg.data();
+        // LEAKS: prog + vertex_shader + frag_shader
+        throw std::runtime_error{ss.str()};
+      }
+    }
+
+    glAttachShader(prog, frag_shader);
+    // dtor: glDetachShader
+
+    glLinkProgram(prog);
+
+    // error check: linking
+    {
+      GLint link_status = GL_FALSE;
+      glGetProgramiv(prog, GL_LINK_STATUS, &link_status);
+      if (link_status == GL_FALSE) {
+        GLint log_len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &log_len);
+
+        std::vector<GLchar> errmsg(log_len);
+        glGetProgramInfoLog(prog, errmsg.size(), nullptr, errmsg.data());
+
+        std::stringstream ss;
+        ss << "OpenGL: glLinkProgram() failed: ";
+        ss << errmsg.data();
+        // LEAKS: prog + vertex_shader + frag_shader
+        throw std::runtime_error{ss.str()};
+      }
+    }
+
+    // get attribs
+    GLint attrib_LVertexPos2D = glGetAttribLocation(prog, "LVertexPos2D");
+    if (attrib_LVertexPos2D == -1) {
+      // LEAKS: prog + vertex_shader + frag_shader
+      throw std::runtime_error{"OpenGL: glGetAttribLocation() returned -1: LVertexPos2D is not a valid glsl program attribute"};
+    }
+
+    glClearColor(0.5f, 0.0f, 0.0f, 1.0f);
+
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    GLfloat vbo_data[] = {
+                          -1.0, -1.0,  // bottom-left
+                          +1.0, -1.0,  // bottom-right
+                          +1.0, +1.0,  // top-right
+                          -1.0, +1.0   // top-left
+    };
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vbo_data), vbo_data, GL_STATIC_DRAW);
+
+    GLuint ibo;
+    glGenBuffers(1, &ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    GLuint ibo_data[] = { 0, 1, 2, 3 };
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(ibo_data), ibo_data, GL_STATIC_DRAW);
+
+    GLint uniform_x_rescale = glGetUniformLocation(prog, "x_rescale");
+    if (uniform_x_rescale == -1) {
+      throw std::runtime_error{"cannot find x_rescale"};
+    }
+
+    GLint uniform_x_offset = glGetUniformLocation(prog, "x_offset");
+    if (uniform_x_offset == -1) {
+      throw std::runtime_error{"cannot find y_rescale"};
+    }
+
+    GLint uniform_y_rescale = glGetUniformLocation(prog, "y_rescale");
+    if (uniform_y_rescale == -1) {
+      throw std::runtime_error{"cannot find y_rescale"};
+    }
+
+    GLint uniform_y_offset = glGetUniformLocation(prog, "y_offset");
+    if (uniform_y_offset == -1) {
+      throw std::runtime_error{"cannot find y_offset"};
+    }
+
+    GLint uniform_num_iterations = glGetUniformLocation(prog, "num_iterations");
+    if (uniform_num_iterations == -1) {
+      throw std::runtime_error{"cannot find num_iterations"};
+    }
+
+    // Set up vao
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+
+    // vao: vertex positions
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glEnableVertexAttribArray(vbo);
+    glVertexAttribPointer(vbo, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+    // vao: LVertexPos2D
+    glEnableVertexAttribArray(attrib_LVertexPos2D);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glVertexAttribPointer(attrib_LVertexPos2D, 2, GL_FLOAT, GL_FALSE, 2*sizeof(GLfloat), nullptr);
+
+    // vao: index buffer
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+
+    // vao: unbind
+    glBindVertexArray(static_cast<GLuint>(0));
+
+    return {
+            .program = prog,
+            .vertex_shader = vertex_shader,
+            .frag_shader = frag_shader,
+            .attrib_LVertexPos2D = attrib_LVertexPos2D,
+            .vao = vao,
+            .vbo = vbo,
+            .ibo = ibo,
+            .uniform_x_rescale = uniform_x_rescale,
+            .uniform_x_offset = uniform_x_offset,
+            .uniform_y_rescale = uniform_y_rescale,
+            .uniform_y_offset = uniform_y_offset,
+            .uniform_num_iterations = uniform_num_iterations
+    };
 }
 
 int main() {
@@ -217,33 +389,71 @@ int main() {
         return -1;
     }
 
+#if __APPLE__
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#else
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+#endif
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_GL_SetSwapInterval(0);
+
     SDL_Window* w = SDL_CreateWindow(
             "Some window",
             SDL_WINDOWPOS_CENTERED,
             SDL_WINDOWPOS_CENTERED,
             1024,
             768,
-            SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESKTOP);
-
+            SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_SHOWN);
     if (w == nullptr) {
         std::cerr << "sdl2: SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
         return -1;
     }
 
-    SDL_Surface* s = SDL_GetWindowSurface(w);
+    SDL_GLContext gl_ctx = SDL_GL_CreateContext(w);
 
-    if (s == nullptr) {
-        std::cerr << "sdl2: SDL_GetWindowSurface failed: " << SDL_GetError() << std::endl;
+    if (gl_ctx == nullptr) {
+        std::cerr << "sdl2: SDL_GL_CreateContext failed: " << SDL_GetError() << std::endl;
         return -1;
     }
 
-    State st{s};
+    if (SDL_GL_MakeCurrent(w, gl_ctx) != 0) {
+        std::cerr << "sdl2: SDL_GL_MakeCurrent failed: " << SDL_GetError() << std::endl;
+        return -1;
+    }
+
+    if (auto err = glewInit(); err != GLEW_OK) {
+        std::cerr << "glewInit() failed: " << glewGetErrorString(err) << std::endl;
+        return -1;
+    }
+
+    SDL_Renderer* r = SDL_CreateRenderer(
+            w,
+            -1,
+            SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (r == nullptr) {
+        std::cerr << "SDL2: SDL_CreateRenderer failed: " << SDL_GetError() << std::endl;
+        return -1;
+    }
+
+    ExampleGLProg p = create_prog();
+
+    int win_width;
+    int win_height;
+    SDL_GetWindowSize(w, &win_width, &win_height);
+    State st{win_width, win_height};
 
     TTF_Font* font = TTF_OpenFont("../FantasqueSansMono-Regular.ttf", 16);
     if (font == nullptr) {
         std::cerr << "sdl2: TTF_OpenFont failed: " << TTF_GetError() << std::endl;
         return -1;
     }
+
+    // vsync: SDL_GL_SetSwapInterval(0);
 
     SDL_Event e;
     bool first_motion = true;
@@ -252,7 +462,7 @@ int main() {
     auto last_frame_time = std::chrono::steady_clock::now();
     for (;;) {
         ++frame;
-        draw_mandelbrot(st);
+        draw_mandelbrot(st, p, w);
         auto cur_time = std::chrono::steady_clock::now();
         std::chrono::duration<double> run_secs = cur_time - started;
         std::chrono::duration<double> frame_time = cur_time - last_frame_time;
@@ -273,15 +483,17 @@ int main() {
                 std::cerr << "sdl2: TTF_RenderText_Solid failed: " << TTF_GetError() << std::endl;
                 return -1;
             }
-            SDL_Rect txtpos{.x = 16, .y = 16, st.display_dimensions().w, st.display_dimensions().h};
-            SDL_BlitSurface(font_surf, NULL, st.surf, &txtpos);
+            SDL_Texture* t = SDL_CreateTextureFromSurface(r, font_surf);
+            if (t == NULL) {
+              throw std::runtime_error{"null texture?"};
+            }
+            SDL_Rect txtpos{.x = 16, .y = 16, font_surf->w, font_surf->h};
+            SDL_RenderCopy(r, t, NULL, &txtpos);
+            SDL_DestroyTexture(t);
             SDL_FreeSurface(font_surf);
         }
 
-        if (SDL_UpdateWindowSurface(w) != 0) {
-            std::cerr << "sdl2: SDL_UpdateWindowSurface failed: " << SDL_GetError() << std::endl;
-            return -1;
-        }
+        SDL_GL_SwapWindow(w);
 
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_KEYDOWN) {
@@ -331,6 +543,7 @@ int main() {
     }
 
     TTF_CloseFont(font);
+    SDL_GL_DeleteContext(gl_ctx);
     SDL_DestroyWindow(w);
     TTF_Quit();
     SDL_Quit();
